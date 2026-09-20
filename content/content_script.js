@@ -1,4 +1,13 @@
 (() => {
+  // Prevent duplicate execution if injected multiple times
+  if (window.__browserNametagActive) {
+    if (typeof window.__browserNametagRefresh === "function") {
+      window.__browserNametagRefresh();
+    }
+    return;
+  }
+  window.__browserNametagActive = true;
+
   let isEnabled = false;
   let customTitle = "";
   let mode = "replace"; // "replace" or "prefix"
@@ -6,58 +15,76 @@
   let isInternalUpdate = false;
   let observer = null;
 
-  function computeTitle(baseOriginal) {
+  function computeTargetTitle(baseOriginal) {
     if (!isEnabled || !customTitle.trim()) {
       return baseOriginal;
     }
     if (mode === "prefix") {
-      const cleanOriginal = baseOriginal ? baseOriginal.trim() : "";
+      const cleanOriginal = (baseOriginal || "").trim();
       return cleanOriginal ? `${customTitle} | ${cleanOriginal}` : customTitle;
     }
     return customTitle;
+  }
+
+  function setTitleDom(newTitle) {
+    if (!newTitle) return;
+    isInternalUpdate = true;
+    
+    document.title = newTitle;
+
+    let titleTag = document.querySelector("title");
+    if (!titleTag && document.head) {
+      titleTag = document.createElement("title");
+      document.head.appendChild(titleTag);
+    }
+    if (titleTag && titleTag.textContent !== newTitle) {
+      titleTag.textContent = newTitle;
+    }
+
+    // Release lock after microtask
+    setTimeout(() => {
+      isInternalUpdate = false;
+    }, 50);
   }
 
   function applyTitle() {
     if (!isEnabled || !customTitle.trim()) {
       return;
     }
-
-    const targetTitle = computeTitle(originalTitle);
-    if (document.title !== targetTitle) {
-      isInternalUpdate = true;
-      document.title = targetTitle;
-      setTimeout(() => {
-        isInternalUpdate = false;
-      }, 0);
+    const target = computeTargetTitle(originalTitle);
+    if (document.title !== target) {
+      setTitleDom(target);
     }
   }
 
   function restoreOriginalTitle() {
     if (originalTitle && document.title !== originalTitle) {
-      isInternalUpdate = true;
-      document.title = originalTitle;
-      setTimeout(() => {
-        isInternalUpdate = false;
-      }, 0);
+      setTitleDom(originalTitle);
     }
   }
 
-  function handleExternalTitleChange() {
+  function onDomTitleMutated() {
     if (isInternalUpdate) {
       return;
     }
 
-    const currentDomTitle = document.title || "";
+    const currentTitle = document.title || "";
     if (isEnabled && customTitle.trim()) {
-      // If in prefix mode, extract real title if it already contains prefix or save fresh
-      if (mode === "prefix" && currentDomTitle.startsWith(customTitle + " | ")) {
-        originalTitle = currentDomTitle.slice((customTitle + " | ").length);
-      } else if (currentDomTitle !== customTitle) {
-        originalTitle = currentDomTitle;
+      if (mode === "prefix") {
+        const prefixMarker = customTitle + " | ";
+        if (currentTitle.startsWith(prefixMarker)) {
+          originalTitle = currentTitle.slice(prefixMarker.length);
+        } else if (currentTitle !== customTitle) {
+          originalTitle = currentTitle;
+        }
+      } else {
+        if (currentTitle !== customTitle) {
+          originalTitle = currentTitle;
+        }
       }
       applyTitle();
     } else {
-      originalTitle = currentDomTitle;
+      originalTitle = currentTitle;
     }
   }
 
@@ -67,12 +94,12 @@
     }
 
     observer = new MutationObserver(() => {
-      handleExternalTitleChange();
+      onDomTitleMutated();
     });
 
-    const target = document.querySelector("head") || document.documentElement;
-    if (target) {
-      observer.observe(target, {
+    const targetNode = document.head || document.documentElement;
+    if (targetNode) {
+      observer.observe(targetNode, {
         subtree: true,
         childList: true,
         characterData: true
@@ -80,7 +107,19 @@
     }
   }
 
-  function initSettings() {
+  function syncConfig(newConfig) {
+    isEnabled = Boolean(newConfig.enabled);
+    customTitle = (newConfig.customTitle || "").trim();
+    mode = newConfig.mode || "replace";
+
+    if (isEnabled && customTitle) {
+      applyTitle();
+    } else {
+      restoreOriginalTitle();
+    }
+  }
+
+  function loadInitialSettings() {
     if (document.title && !originalTitle) {
       originalTitle = document.title;
     }
@@ -92,41 +131,45 @@
         mode: "replace"
       },
       (items) => {
-        isEnabled = Boolean(items.enabled);
-        customTitle = items.customTitle || "";
-        mode = items.mode || "replace";
-
-        if (isEnabled && customTitle.trim()) {
-          applyTitle();
-        }
+        syncConfig(items);
       }
     );
   }
 
-  // Listen for real-time updates from background / popup
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message && message.type === "UPDATE_CONFIG") {
-      isEnabled = Boolean(message.enabled);
-      customTitle = message.customTitle || "";
-      mode = message.mode || "replace";
+  window.__browserNametagRefresh = loadInitialSettings;
 
-      if (isEnabled && customTitle.trim()) {
-        applyTitle();
-      } else {
-        restoreOriginalTitle();
-      }
-      sendResponse({ status: "ok" });
+  // Listen for storage changes directly
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === "sync" || areaName === "local") {
+      chrome.storage.sync.get(
+        {
+          enabled: false,
+          customTitle: "",
+          mode: "replace"
+        },
+        (items) => {
+          syncConfig(items);
+        }
+      );
     }
   });
 
-  // Observe DOM ready states
+  // Listen for runtime messages
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message && message.type === "UPDATE_CONFIG") {
+      syncConfig(message);
+      sendResponse({ status: "applied" });
+    }
+  });
+
+  // Handle page lifecycle events
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {
       if (!originalTitle && document.title) {
         originalTitle = document.title;
       }
       setupObserver();
-      if (isEnabled && customTitle.trim()) {
+      if (isEnabled && customTitle) {
         applyTitle();
       }
     });
@@ -134,5 +177,27 @@
     setupObserver();
   }
 
-  initSettings();
+  // Periodic heartbeat / focus check to guarantee title is locked
+  window.addEventListener("focus", () => {
+    if (isEnabled && customTitle) {
+      applyTitle();
+    }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (isEnabled && customTitle) {
+      applyTitle();
+    }
+  });
+
+  setInterval(() => {
+    if (isEnabled && customTitle) {
+      const target = computeTargetTitle(originalTitle);
+      if (document.title !== target) {
+        applyTitle();
+      }
+    }
+  }, 1000);
+
+  loadInitialSettings();
 })();

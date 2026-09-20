@@ -90,6 +90,17 @@ document.addEventListener("DOMContentLoaded", () => {
         type: "BROADCAST_CONFIG",
         config: newConfig
       });
+
+      // Also directly attempt instant message to active tab
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs && tabs[0] && tabs[0].id) {
+          chrome.tabs.sendMessage(tabs[0].id, {
+            type: "UPDATE_CONFIG",
+            ...newConfig
+          }).catch(() => {});
+        }
+      });
+
       showNotification(isEnabled ? "Заголовок успешно применен!" : "Подмена отключена");
     });
   }
